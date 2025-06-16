@@ -86,18 +86,20 @@ class TerminalSocketIOClient:
                 )
 
     async def connect(self):
-        for attempt in range(3):
-            try:
-                logger.info(
-                    f"[MID:{self.mid} TID:{self.tid}] Connecting to {self.masked_url} (attempt {attempt+1})..."
-                )
-                await self.sio.connect(self.url, transports=["websocket"])
-                await self.sio.wait()
-                break
-            except Exception as e:
-                logger.error(f"[MID:{self.mid} TID:{self.tid}] Connection error: {e}")
-                await asyncio.sleep(5)
-        await self.session.close()
+        try:
+            for attempt in range(3):
+                try:
+                    logger.info(
+                        f"[MID:{self.mid} TID:{self.tid}] Connecting to {self.masked_url} (attempt {attempt+1})..."
+                    )
+                    await self.sio.connect(self.url, transports=["websocket"])
+                    await self.sio.wait()
+                    break
+                except Exception as e:
+                    logger.error(f"[MID:{self.mid} TID:{self.tid}] Connection error: {e}")
+                    await asyncio.sleep(5)
+        finally:
+            await self.session.close()
 
 
 async def run_client(mid, tid, token):
@@ -107,6 +109,9 @@ async def run_client(mid, tid, token):
             await client.connect()
             logger.info(f"[MID:{mid} TID:{tid}] Reconnecting in 5 seconds...")
             await asyncio.sleep(5)
+        except asyncio.CancelledError:
+            logger.info(f"[MID:{mid} TID:{tid}] Shutdown requested")
+            break
         except Exception as e:
             logger.error(f"[MID:{mid} TID:{tid}] Error: {e}")
             logger.info(f"[MID:{mid} TID:{tid}] Retrying in 5 seconds...")
@@ -115,15 +120,18 @@ async def run_client(mid, tid, token):
 
 async def periodic_status():
     """Show periodic status of all connections"""
-    while True:
-        await asyncio.sleep(25)  # Every 25 seconds to align with server ping interval
-        async with terminals_lock:
-            if connected_terminals:
-                logger.info(
-                    f"STATUS: {len(connected_terminals)} terminals connected: {connected_terminals}"
-                )
-            else:
-                logger.info("STATUS: No terminals connected")
+    try:
+        while True:
+            await asyncio.sleep(25)  # Every 25 seconds to align with server ping interval
+            async with terminals_lock:
+                if connected_terminals:
+                    logger.info(
+                        f"STATUS: {len(connected_terminals)} terminals connected: {connected_terminals}"
+                    )
+                else:
+                    logger.info("STATUS: No terminals connected")
+    except asyncio.CancelledError:
+        logger.info("Status monitoring stopped")
 
 
 async def main():
@@ -142,25 +150,33 @@ async def main():
         return
     logger.info(f"Starting Socket.IO clients for {len(terminals)} terminals...")
 
-    def signal_handler(signum, frame):
-        logger.info("\nDisconnecting all clients...")
-        sys.exit(0)
-
-    signal.signal(signal.SIGINT, signal_handler)
-
     status_task = asyncio.create_task(periodic_status())
-
     tasks = []
+    
     for terminal in terminals:
         task = asyncio.create_task(run_client(terminal["mid"], terminal["tid"], token))
         tasks.append(task)
+    
+    all_tasks = [status_task] + tasks
+    
     try:
-        await asyncio.gather(status_task, *tasks)
-    except KeyboardInterrupt:
-        logger.info("\nExiting...")
-        status_task.cancel()
-        for task in tasks:
+        await asyncio.gather(*all_tasks)
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        logger.info("\nShutting down gracefully...")
+        
+        # Cancel all tasks
+        for task in all_tasks:
             task.cancel()
+        
+        # Wait for tasks to complete cancellation with proper exception handling
+        results = await asyncio.gather(*all_tasks, return_exceptions=True)
+        
+        # Log any unexpected exceptions (not CancelledError)
+        for i, result in enumerate(results):
+            if isinstance(result, Exception) and not isinstance(result, asyncio.CancelledError):
+                logger.error(f"Task {i} failed during shutdown: {result}")
+        
+        logger.info("All clients disconnected successfully")
 
 
 if __name__ == "__main__":
